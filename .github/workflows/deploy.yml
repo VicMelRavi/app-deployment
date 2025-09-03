@@ -1,0 +1,137 @@
+name: Deploy to AWS
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: ap-southeast-2
+  
+jobs:
+  terraform:
+    name: Terraform
+    runs-on: ubuntu-latest
+    outputs:
+      instance_ip: ${{ steps.apply.outputs.instance_ip }}
+      
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Terraform
+      uses: hashicorp/setup-terraform@v3
+      with:
+        terraform_version: 1.5.0
+        terraform_wrapper: false
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Terraform Init
+      working-directory: terraform
+      run: terraform init
+
+    - name: Terraform Plan
+      working-directory: terraform
+      run: |
+        terraform plan \
+          -var="public_key=${{ secrets.SSH_PUBLIC_KEY }}" \
+          -out=tfplan
+
+    - name: Terraform Apply
+      id: apply
+      working-directory: terraform
+      run: |
+        terraform apply tfplan
+        echo "instance_ip=$(terraform output -raw instance_ip)" >> $GITHUB_OUTPUT
+
+  ansible:
+    name: Ansible Configuration
+    runs-on: ubuntu-latest
+    needs: terraform
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.10'
+
+    - name: Install Ansible
+      run: |
+        pip install ansible
+
+    - name: Setup SSH key
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+
+    - name: Update Ansible inventory
+      run: |
+        sed -i 's/INSTANCE_IP_HERE/${{ needs.terraform.outputs.instance_ip }}/g' ansible/inventory.ini
+
+    - name: Wait for SSH to be ready
+      run: |
+        for i in {1..30}; do
+          if ssh -o StrictHostKeyChecking=no -i ~/.ssh/id_rsa ubuntu@${{ needs.terraform.outputs.instance_ip }} exit; then
+            echo "SSH is ready"
+            break
+          fi
+          echo "Waiting for SSH... ($i/30)"
+          sleep 10
+        done
+
+    - name: Run Ansible Playbook
+      working-directory: ansible
+      run: |
+        ansible-playbook -i inventory.ini playbook.yml
+
+  deploy:
+    name: Deploy Application
+    runs-on: ubuntu-latest
+    needs: [terraform, ansible]
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - name: Setup SSH key
+      run: |
+        mkdir -p ~/.ssh
+        echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+        chmod 600 ~/.ssh/id_rsa
+
+    - name: Build and deploy Docker application
+      run: |
+        # Copy application files to server
+        scp -o StrictHostKeyChecking=no -r app/ ubuntu@${{ needs.terraform.outputs.instance_ip }}:/opt/
+        
+        # Build and run Docker container
+        ssh -o StrictHostKeyChecking=no ubuntu@${{ needs.terraform.outputs.instance_ip }} << 'EOF'
+          cd /opt/app
+          
+          # Stop existing container if running
+          sudo docker stop my-app || true
+          sudo docker rm my-app || true
+          
+          # Build new image
+          sudo docker build -t my-app:latest .
+          
+          # Run new container
+          sudo docker run -d --name my-app -p 3000:3000 --restart unless-stopped my-app:latest
+        EOF
+
+    - name: Verify deployment
+      run: |
+        sleep 30
+        curl -f http://${{ needs.terraform.outputs.instance_ip }} || exit 1
+        echo "✅ Application deployed successfully at http://${{ needs.terraform.outputs.instance_ip }}"
